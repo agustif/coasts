@@ -80,9 +80,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let content_type = response.headers().get("content-type").unwrap();
-        assert!(content_type.to_str().unwrap().contains("text/html"));
+        #[cfg(coast_skip_ui_build)]
+        {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[cfg(not(coast_skip_ui_build))]
+        {
+            assert_eq!(response.status(), StatusCode::OK);
+            let content_type = response.headers().get("content-type").unwrap();
+            assert!(content_type.to_str().unwrap().contains("text/html"));
+        }
     }
 
     #[tokio::test]

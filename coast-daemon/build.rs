@@ -2,6 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(coast_skip_ui_build)");
+
     let guard_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../coast-guard");
 
     if !guard_dir.join("package.json").exists() {
@@ -21,14 +23,8 @@ fn main() {
 
     // Skip the npm build in CI or when explicitly opted out
     if std::env::var("COAST_SKIP_UI_BUILD").is_ok() {
+        println!("cargo:rustc-cfg=coast_skip_ui_build");
         println!("cargo:warning=COAST_SKIP_UI_BUILD set, skipping UI build");
-        return;
-    }
-
-    let dist_index = guard_dir.join("dist").join("index.html");
-    if dist_index.exists() {
-        // Already built — don't rebuild unless sources changed (cargo handles
-        // this via rerun-if-changed directives above).
         return;
     }
 
