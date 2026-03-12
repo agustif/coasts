@@ -6,11 +6,21 @@
 
 Coasts (Containerized Hosts) is a CLI tool with a local observability UI for running multiple isolated instances of a full development environment on a single machine. It works out of the box with your current setup: no changes to your existing application code, just a small `Coastfile` at your repo root. If you already use Docker Compose, Coasts can boot from your existing `docker-compose.yml`; if you do not use Docker or Compose, Coasts works just as well.
 
-Build once and run N instances with whatever volume and networking topology your project needs. Check out one coast at a time to bind canonical ports to your host, and use dynamic ports to peek at any other worktree.
+Build once and run N instances with whatever volume and networking topology your project needs. Check out one coast at a time to bind canonical ports to your host, and use dynamic ports to peek into the progress of any worktree.
 
 Coasts is agnostic to AI providers and agent harnesses. The only host requirement is Git worktrees, so you can switch tools without changing how you work and without any harness-specific environment setup.
 
 Coasts is also offline-first with no hosted service dependency, so there is no vendor lock-in risk: even if we disappeared, your local workflow would keep running.
+
+## Installation
+
+Install the latest public release:
+
+```sh
+eval "$(curl -fsSL https://coasts.dev/install)"
+```
+
+[Visit coasts.dev](https://coasts.dev) for the website, docs, and installation instructions.
 
 ![Coastguard overview showing multiple coasts](assets/coastguard-overview-live.png)
 
@@ -18,19 +28,17 @@ Coasts is also offline-first with no hosted service dependency, so there is no v
 
 For the full user-facing documentation, see the [Coasts docs](https://coasts.dev/docs).
 
+## Demo Repo
+
+Want a concrete example to explore? Check out the [`coasts-demo` repository](https://github.com/coast-guard/coasts-demo) for a small demo project you can use to try Coasts end to end.
+
 ## Contributing
 
-To contribute, read the [contributing guide](CONTRIBUTING.md).
+To contribute, read the [contributing guide](CONTRIBUTING.md) for PR guidelines.
 
 > Note: Coasts is currently macOS-specific. General Linux support is coming shortly.
 
-## Installation
-
-```sh
-curl -fsSL https://coasts.dev/install | sh
-```
-
-## Prerequisites
+### Prerequisites
 
 - Rust (stable toolchain)
 - Docker
@@ -38,55 +46,17 @@ curl -fsSL https://coasts.dev/install | sh
 - socat (`brew install socat` on macOS)
 - Git
 
-## Building
-
-```bash
-cargo build --release
-```
-
-Binaries are placed in `target/release/`:
-- `coast` -- the CLI client
-- `coastd` -- the background daemon
-
-## Quick Start (building from source)
-
-```bash
-# Start the daemon
-coastd --foreground &
-
-# In a project with a Coastfile and docker-compose.yml:
-coast build
-coast run main
-coast run feature-x --worktree feature/x
-
-# Swap which instance owns the canonical ports
-coast checkout main
-coast checkout feature-x
-
-# Inspect
-coast ls
-coast ps main
-coast logs main
-coast ports main
-
-# Clean up
-coast rm main
-coast rm feature-x
-```
-
-## Development
-
 ### Dev setup
 
-If you have coast globally installed, the production daemon occupies `~/.coast/` and port 31415. The workspace builds separate `coast-dev` and `coastd-dev` binaries that use `~/.coast-dev/` and port 31416, so the two never conflict.
-
-Run the setup script once to build everything and symlink the dev binaries into `~/.local/bin`:
+Run the setup script once to build the web UI, compile the workspace, and symlink `coast-dev` / `coastd-dev` into `~/.local/bin`:
 
 ```bash
 ./dev_setup.sh
 ```
 
-This builds the web UI, compiles the workspace, and creates `coast-dev` / `coastd-dev` symlinks. On first run it adds `~/.local/bin` to your PATH — restart your shell or `source ~/.zshrc` to pick it up.
+On first run it adds `~/.local/bin` to your PATH — restart your shell or `source ~/.zshrc` to pick it up.
+
+Dev mode uses `~/.coast-dev/` and port 31416, so it never conflicts with a global coast install on port 31415.
 
 ### Day-to-day development workflow
 
@@ -215,3 +185,41 @@ coast/
   integrated-examples/  # Example projects and shell-based integration tests
 ```
 
+## Building from source
+
+```bash
+cargo build --release
+```
+
+Binaries are placed in `target/release/`:
+- `coast` -- the CLI client
+- `coastd` -- the background daemon
+
+```bash
+# Start the daemon
+coastd --foreground &
+
+# In a project with a Coastfile and docker-compose.yml:
+coast build
+coast run main
+coast run feature-x --worktree feature/x
+
+# Swap which instance owns the canonical ports
+coast checkout main
+coast checkout feature-x
+
+# Inspect
+coast ls
+coast ps main
+coast logs main
+coast ports main
+
+# Clean up
+coast rm main
+coast rm feature-x
+```
+
+## Original History
+
+
+This project started in another repository and had some of its history squashed. Please see the [original repo here](https://github.com/jsx-tool/coasts) for the full commit history.

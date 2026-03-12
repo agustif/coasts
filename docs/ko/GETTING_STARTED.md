@@ -1,6 +1,9 @@
 # Coasts 시작하기
 
-아직 하지 않았다면, 먼저 아래의 설치 및 요구 사항을 완료하세요. 그런 다음 이 가이드는 프로젝트에서 Coast를 사용하는 방법을 안내합니다.
+```youtube
+Je921fgJ4RY
+Part of the [Coasts Video Course](learn-coasts-videos/README.md).
+```
 
 ## 설치
 
@@ -54,26 +57,13 @@ Coastfile은 *일반적으로* 기존의 `docker-compose.yml`을 가리키는 �
 
 프로젝트용 Coastfile을 만드는 가장 빠른 방법은 코딩 에이전트가 만들도록 하는 것입니다.
 
-Coasts CLI에는 어떤 AI 에이전트에게든 Coastfile 전체 스키마와 CLI를 가르쳐주는 내장 프롬프트가 포함되어 있습니다. 여기에서 확인할 수 있습니다: [installation_prompt.txt](installation_prompt.txt)
+Coasts CLI에는 어떤 AI 에이전트에게든 Coastfile 전체 스키마와 CLI를 가르쳐주는 내장 프롬프트가 포함되어 있습니다. 이를 에이전트의 채팅에 복사해 넣으면 프로젝트를 분석하고 Coastfile을 생성합니다.
 
-에이전트에 직접 전달하거나, [installation prompt](installation_prompt.txt)를 복사해 에이전트 채팅에 붙여넣으세요:
-
-```bash-emphasis
-# Claude Code
-claude -p "$(coast installation-prompt)"
-
-# Codex
-codex "$(coast installation-prompt)"
-
-# Cursor (from terminal)
-cursor --chat "$(coast installation-prompt)"
-
-# Other agents (manual)
-coast installation-prompt
-# copy the output into your agent's system prompt
+```prompt-copy
+installation_prompt.txt
 ```
 
-이 프롬프트는 Coastfile TOML 형식, 볼륨 전략, 시크릿 주입, 그리고 관련된 모든 CLI 명령을 다룹니다. 에이전트는 프로젝트를 분석하고 Coastfile을 생성합니다.
+또한 `coast installation-prompt`를 실행하면 CLI에서 동일한 출력을 얻을 수 있습니다.
 
 ## 첫 번째 Coast
 
@@ -120,7 +110,7 @@ coast ls
 # dev-1  my-project  running  main    dind     -         ✓   ~/dev/my-project
 ```
 
-프로젝트의 Coastguard 관측(Observability) UI를 띄우려면:
+프로젝트의 Coastguard 관측 UI를 띄우려면:
 
 ```bash
 coast ui

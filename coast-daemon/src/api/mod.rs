@@ -18,17 +18,23 @@ pub mod ws_stats;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(not(coast_skip_ui_build))]
 use axum::body::Body;
-use axum::http::{header, StatusCode};
+#[cfg(not(coast_skip_ui_build))]
+use axum::http::header;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use rust_embed::Embed;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::server::AppState;
 
 pub const DEFAULT_API_PORT: u16 = 31415;
 
+#[cfg(not(coast_skip_ui_build))]
+use rust_embed::Embed;
+
+#[cfg(not(coast_skip_ui_build))]
 #[derive(Embed)]
 #[folder = "../coast-guard/dist/"]
 #[prefix = ""]
@@ -91,23 +97,36 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 }
 
 async fn serve_embedded_ui(uri: axum::http::Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
+    #[cfg(coast_skip_ui_build)]
+    {
+        let _ = uri;
+        return (
+            StatusCode::NOT_FOUND,
+            "Coast Guard UI not available in backend-only build",
+        )
+            .into_response();
+    }
 
-    // Try the exact path first, then fall back to index.html for SPA routing
-    if let Some(content) = UiAssets::get(path) {
-        let mime = mime_guess::from_path(path).first_or_octet_stream();
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, mime.as_ref())
-            .body(Body::from(content.data.to_vec()))
-            .unwrap()
-    } else if let Some(index) = UiAssets::get("index.html") {
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/html")
-            .body(Body::from(index.data.to_vec()))
-            .unwrap()
-    } else {
-        (StatusCode::NOT_FOUND, "Coast Guard UI not available").into_response()
+    #[cfg(not(coast_skip_ui_build))]
+    {
+        let path = uri.path().trim_start_matches('/');
+
+        // Try the exact path first, then fall back to index.html for SPA routing
+        if let Some(content) = UiAssets::get(path) {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(Body::from(content.data.to_vec()))
+                .unwrap()
+        } else if let Some(index) = UiAssets::get("index.html") {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(Body::from(index.data.to_vec()))
+                .unwrap()
+        } else {
+            (StatusCode::NOT_FOUND, "Coast Guard UI not available").into_response()
+        }
     }
 }

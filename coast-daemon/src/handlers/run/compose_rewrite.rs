@@ -1,19 +1,20 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tracing::info;
 
+type YamlMapping = serde_yaml::Mapping;
+
 /// Configuration for rewriting a compose file for a coast instance.
 pub(super) struct ComposeRewriteConfig<'a> {
-    /// Services to remove (shared services + explicitly omitted).
-    pub shared_service_names: &'a [String],
+    /// Shared services to remove and remap via extra_hosts.
+    pub shared_service_hosts: &'a HashMap<String, String>,
     /// Path to the coastfile (for reading omit config and volume definitions).
     pub coastfile_path: &'a Path,
     /// Per-instance image tags: (service_name, image_tag).
     pub per_instance_image_tags: &'a [(String, String)],
     /// Whether the instance has coast-managed volume mounts.
     pub has_volume_mounts: bool,
-    /// Bridge gateway IP for extra_hosts entries.
-    pub bridge_gateway_ip: Option<&'a str>,
     /// Container paths of secret bind mounts to inject into each service.
     pub secret_container_paths: &'a [String],
     /// Project name (used for override directory path).
@@ -59,278 +60,444 @@ pub(super) fn rewrite_compose_for_instance(
 /// 5. Apply coast-managed volume overrides
 /// 6. Add extra_hosts entries for host.docker.internal and shared services
 /// 7. Add secret file volume mounts to all remaining services
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub(super) fn rewrite_compose_yaml(
     compose_content: &str,
     config: &ComposeRewriteConfig<'_>,
 ) -> Option<String> {
     let mut yaml = serde_yaml::from_str::<serde_yaml::Value>(compose_content).ok()?;
+    let base_yaml = yaml.clone();
+    let coastfile = load_coastfile(config.coastfile_path);
+    let stubbed_services = collect_stubbed_services(config, coastfile.as_ref());
+    let removed_service_volume_names =
+        collect_named_volumes_for_services(&base_yaml, &stubbed_services);
 
     let mut needs_write = false;
-
-    let mut svc_stub: std::collections::HashSet<String> =
-        config.shared_service_names.iter().cloned().collect();
-
-    if config.coastfile_path.exists() {
-        if let Ok(cf) = coast_core::coastfile::Coastfile::from_file(config.coastfile_path) {
-            for svc in &cf.omit.services {
-                svc_stub.insert(svc.clone());
-            }
-        }
-    }
-
-    // --- Remove shared services from the services section ---
-    if !svc_stub.is_empty() {
-        if let Some(services) = yaml.get_mut("services").and_then(|s| s.as_mapping_mut()) {
-            for svc_name in &svc_stub {
-                let key = serde_yaml::Value::String(svc_name.clone());
-                if services.remove(&key).is_some() {
-                    needs_write = true;
-                    tracing::info!(service = %svc_name, "removed shared service from inner compose");
-                }
-            }
-
-            // Strip depends_on references to removed shared services
-            let svc_keys: Vec<serde_yaml::Value> = services.keys().cloned().collect();
-            for svc_key in svc_keys {
-                if let Some(svc_def) = services.get_mut(&svc_key).and_then(|v| v.as_mapping_mut()) {
-                    let dep_key = serde_yaml::Value::String("depends_on".into());
-                    let mut remove_depends = false;
-                    if let Some(deps) = svc_def.get_mut(&dep_key) {
-                        if let Some(dep_map) = deps.as_mapping_mut() {
-                            for svc_name in &svc_stub {
-                                dep_map.remove(serde_yaml::Value::String(svc_name.clone()));
-                            }
-                            if dep_map.is_empty() {
-                                remove_depends = true;
-                            }
-                        } else if let Some(dep_seq) = deps.as_sequence_mut() {
-                            dep_seq.retain(|v| {
-                                v.as_str().map(|s| !svc_stub.contains(s)).unwrap_or(true)
-                            });
-                            if dep_seq.is_empty() {
-                                remove_depends = true;
-                            }
-                        }
-                    }
-                    if remove_depends {
-                        svc_def.remove(&dep_key);
-                    }
-                }
-            }
-        }
-
-        // Remove top-level volume definitions used only by shared services
-        if let Some(top_volumes) = yaml.get_mut("volumes").and_then(|v| v.as_mapping_mut()) {
-            let shared_vol_names: Vec<String> = svc_stub
-                .iter()
-                .flat_map(|svc| {
-                    if let Ok(base) = serde_yaml::from_str::<serde_yaml::Value>(compose_content) {
-                        if let Some(svc_def) = base
-                            .get("services")
-                            .and_then(|s| s.get(svc.as_str()))
-                            .and_then(|v| v.as_mapping())
-                        {
-                            if let Some(vols) = svc_def
-                                .get(serde_yaml::Value::String("volumes".into()))
-                                .and_then(|v| v.as_sequence())
-                            {
-                                return vols
-                                    .iter()
-                                    .filter_map(|v| {
-                                        let s = v.as_str().unwrap_or("");
-                                        let src = s.split(':').next().unwrap_or("");
-                                        if !src.starts_with('.')
-                                            && !src.starts_with('/')
-                                            && !src.is_empty()
-                                        {
-                                            Some(src.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect::<Vec<_>>();
-                            }
-                        }
-                    }
-                    vec![]
-                })
-                .collect();
-            for vol_name in &shared_vol_names {
-                top_volumes.remove(serde_yaml::Value::String(vol_name.clone()));
-            }
-        }
-    }
-
-    // --- Remove explicitly omitted volumes ---
-    if config.coastfile_path.exists() {
-        if let Ok(cf) = coast_core::coastfile::Coastfile::from_file(config.coastfile_path) {
-            if !cf.omit.volumes.is_empty() {
-                if let Some(top_volumes) = yaml.get_mut("volumes").and_then(|v| v.as_mapping_mut())
-                {
-                    for vol_name in &cf.omit.volumes {
-                        if top_volumes
-                            .remove(serde_yaml::Value::String(vol_name.clone()))
-                            .is_some()
-                        {
-                            tracing::info!(volume = %vol_name, "removed omitted volume from inner compose");
-                            needs_write = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // --- Apply per-instance image overrides ---
-    for (service_name, tag) in config.per_instance_image_tags {
-        if let Some(svc_def) = yaml
-            .get_mut("services")
-            .and_then(|s| s.get_mut(service_name.as_str()))
-            .and_then(|v| v.as_mapping_mut())
-        {
-            svc_def.insert(
-                serde_yaml::Value::String("image".into()),
-                serde_yaml::Value::String(tag.clone()),
-            );
-            svc_def.remove(serde_yaml::Value::String("build".into()));
-            needs_write = true;
-        }
-    }
-
-    // --- Apply volume overrides (coast-managed named volumes) ---
-    if config.has_volume_mounts && config.coastfile_path.exists() {
-        if let Ok(cf) = coast_core::coastfile::Coastfile::from_file(config.coastfile_path) {
-            let top_vols = yaml
-                .as_mapping_mut()
-                .unwrap()
-                .entry(serde_yaml::Value::String("volumes".into()))
-                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-            if let Some(vol_map) = top_vols.as_mapping_mut() {
-                for vol_config in &cf.volumes {
-                    let container_mount = format!("/coast-volumes/{}", vol_config.name);
-                    let mut opts = serde_yaml::Mapping::new();
-                    opts.insert(
-                        serde_yaml::Value::String("driver".into()),
-                        serde_yaml::Value::String("local".into()),
-                    );
-                    let mut driver_opts = serde_yaml::Mapping::new();
-                    driver_opts.insert(
-                        serde_yaml::Value::String("type".into()),
-                        serde_yaml::Value::String("none".into()),
-                    );
-                    driver_opts.insert(
-                        serde_yaml::Value::String("device".into()),
-                        serde_yaml::Value::String(container_mount),
-                    );
-                    driver_opts.insert(
-                        serde_yaml::Value::String("o".into()),
-                        serde_yaml::Value::String("bind".into()),
-                    );
-                    opts.insert(
-                        serde_yaml::Value::String("driver_opts".into()),
-                        serde_yaml::Value::Mapping(driver_opts),
-                    );
-                    vol_map.insert(
-                        serde_yaml::Value::String(vol_config.name.clone()),
-                        serde_yaml::Value::Mapping(opts),
-                    );
-                }
-                needs_write = true;
-            }
-        }
-    }
-
-    // --- Add extra_hosts and secret volume mounts to remaining services ---
-    if let Some(services) = yaml.get_mut("services").and_then(|s| s.as_mapping_mut()) {
-        let svc_keys: Vec<String> = services
-            .keys()
-            .filter_map(|k| k.as_str().map(String::from))
-            .collect();
-
-        for svc_name in &svc_keys {
-            if let Some(svc_def) = services
-                .get_mut(serde_yaml::Value::String(svc_name.clone()))
-                .and_then(|v| v.as_mapping_mut())
-            {
-                // extra_hosts: host.docker.internal + shared service hostnames
-                let hosts_key = serde_yaml::Value::String("extra_hosts".into());
-                let hosts_seq = svc_def
-                    .entry(hosts_key)
-                    .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
-                if let Some(seq) = hosts_seq.as_sequence_mut() {
-                    let existing: std::collections::HashSet<String> = seq
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    let entry = "host.docker.internal:host-gateway".to_string();
-                    if !existing.contains(&entry) {
-                        seq.push(serde_yaml::Value::String(entry));
-                    }
-                    let host_target = config.bridge_gateway_ip.unwrap_or("host-gateway");
-                    for shared_name in config.shared_service_names {
-                        let e = format!("{shared_name}:{host_target}");
-                        if !existing.contains(&e) {
-                            seq.push(serde_yaml::Value::String(e));
-                        }
-                    }
-                    needs_write = true;
-                }
-
-                // Secret file mounts
-                if !config.secret_container_paths.is_empty() {
-                    let vols_key = serde_yaml::Value::String("volumes".into());
-                    let vols_seq = svc_def
-                        .entry(vols_key)
-                        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
-                    if let Some(seq) = vols_seq.as_sequence_mut() {
-                        for cp in config.secret_container_paths {
-                            let mount = format!("{cp}:{cp}:ro");
-                            seq.push(serde_yaml::Value::String(mount));
-                        }
-                        needs_write = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // --- Add rslave propagation to bind-mount volumes for hot services ---
-    if config.default_hot || !config.hot_services.is_empty() {
-        if let Some(services) = yaml.get_mut("services").and_then(|s| s.as_mapping_mut()) {
-            let svc_names: Vec<String> = services
-                .keys()
-                .filter_map(|k| k.as_str().map(String::from))
-                .collect();
-            for svc_name in &svc_names {
-                let is_hot =
-                    config.default_hot || config.hot_services.iter().any(|s| s == svc_name);
-                if !is_hot {
-                    continue;
-                }
-                if let Some(svc_def) = services
-                    .get_mut(serde_yaml::Value::String(svc_name.clone()))
-                    .and_then(|v| v.as_mapping_mut())
-                {
-                    let vols_key = serde_yaml::Value::String("volumes".into());
-                    if let Some(vols_seq) =
-                        svc_def.get_mut(&vols_key).and_then(|v| v.as_sequence_mut())
-                    {
-                        for vol in vols_seq.iter_mut() {
-                            rewrite_volume_with_rslave(vol);
-                        }
-                        needs_write = true;
-                    }
-                }
-            }
-        }
-    }
+    needs_write |= remove_stubbed_services_and_depends_on(&mut yaml, &stubbed_services);
+    remove_top_level_volumes(&mut yaml, &removed_service_volume_names);
+    needs_write |= remove_omitted_volumes(&mut yaml, coastfile.as_ref());
+    needs_write |= apply_image_overrides(&mut yaml, config.per_instance_image_tags);
+    needs_write |= apply_coast_managed_volume_overrides(&mut yaml, coastfile.as_ref(), config);
+    needs_write |= add_service_hosts_and_secret_mounts(&mut yaml, config);
+    needs_write |= apply_hot_service_rslave_overrides(&mut yaml, config);
 
     if needs_write {
         serde_yaml::to_string(&yaml).ok()
     } else {
         None
     }
+}
+
+fn load_coastfile(path: &Path) -> Option<coast_core::coastfile::Coastfile> {
+    path.exists()
+        .then(|| coast_core::coastfile::Coastfile::from_file(path).ok())
+        .flatten()
+}
+
+fn collect_stubbed_services(
+    config: &ComposeRewriteConfig<'_>,
+    coastfile: Option<&coast_core::coastfile::Coastfile>,
+) -> std::collections::HashSet<String> {
+    let mut stubbed_services: std::collections::HashSet<String> =
+        config.shared_service_hosts.keys().cloned().collect();
+    if let Some(coastfile) = coastfile {
+        for service in &coastfile.omit.services {
+            stubbed_services.insert(service.clone());
+        }
+    }
+    stubbed_services
+}
+
+fn collect_named_volumes_for_services(
+    yaml: &serde_yaml::Value,
+    service_names: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    service_names
+        .iter()
+        .flat_map(|service_name| {
+            yaml.get("services")
+                .and_then(|services| services.get(service_name.as_str()))
+                .and_then(|service| service.as_mapping())
+                .and_then(get_service_named_volumes)
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn get_service_named_volumes(service_definition: &YamlMapping) -> Option<Vec<String>> {
+    service_definition
+        .get(serde_yaml::Value::String("volumes".into()))
+        .and_then(|volumes| volumes.as_sequence())
+        .map(|volumes| {
+            volumes
+                .iter()
+                .filter_map(|volume| {
+                    let volume_str = volume.as_str().unwrap_or("");
+                    let source = volume_str.split(':').next().unwrap_or("");
+                    is_named_volume_source(source).then(|| source.to_string())
+                })
+                .collect()
+        })
+}
+
+fn is_named_volume_source(source: &str) -> bool {
+    !source.starts_with('.') && !source.starts_with('/') && !source.is_empty()
+}
+
+fn remove_stubbed_services_and_depends_on(
+    yaml: &mut serde_yaml::Value,
+    stubbed_services: &std::collections::HashSet<String>,
+) -> bool {
+    if stubbed_services.is_empty() {
+        return false;
+    }
+
+    let Some(services) = yaml
+        .get_mut("services")
+        .and_then(|services| services.as_mapping_mut())
+    else {
+        return false;
+    };
+
+    let removed_any = remove_stubbed_services(services, stubbed_services);
+    strip_stubbed_depends_on_references(services, stubbed_services);
+    removed_any
+}
+
+fn remove_stubbed_services(
+    services: &mut YamlMapping,
+    stubbed_services: &std::collections::HashSet<String>,
+) -> bool {
+    let mut removed_any = false;
+    for service_name in stubbed_services {
+        let key = serde_yaml::Value::String(service_name.clone());
+        if services.remove(&key).is_some() {
+            removed_any = true;
+            tracing::info!(service = %service_name, "removed shared service from inner compose");
+        }
+    }
+    removed_any
+}
+
+fn strip_stubbed_depends_on_references(
+    services: &mut YamlMapping,
+    stubbed_services: &std::collections::HashSet<String>,
+) {
+    let service_keys: Vec<serde_yaml::Value> = services.keys().cloned().collect();
+    for service_key in service_keys {
+        if let Some(service_definition) = services
+            .get_mut(&service_key)
+            .and_then(|service| service.as_mapping_mut())
+        {
+            strip_depends_on_from_service(service_definition, stubbed_services);
+        }
+    }
+}
+
+fn strip_depends_on_from_service(
+    service_definition: &mut YamlMapping,
+    stubbed_services: &std::collections::HashSet<String>,
+) {
+    let depends_on_key = serde_yaml::Value::String("depends_on".into());
+    let mut remove_depends_on_key = false;
+    if let Some(depends_on) = service_definition.get_mut(&depends_on_key) {
+        if let Some(depends_on_map) = depends_on.as_mapping_mut() {
+            for service_name in stubbed_services {
+                depends_on_map.remove(serde_yaml::Value::String(service_name.clone()));
+            }
+            remove_depends_on_key = depends_on_map.is_empty();
+        } else if let Some(depends_on_sequence) = depends_on.as_sequence_mut() {
+            depends_on_sequence.retain(|value| {
+                value
+                    .as_str()
+                    .map(|service| !stubbed_services.contains(service))
+                    .unwrap_or(true)
+            });
+            remove_depends_on_key = depends_on_sequence.is_empty();
+        }
+    }
+    if remove_depends_on_key {
+        service_definition.remove(&depends_on_key);
+    }
+}
+
+fn remove_top_level_volumes(yaml: &mut serde_yaml::Value, volume_names: &[String]) {
+    let Some(top_level_volumes) = yaml
+        .get_mut("volumes")
+        .and_then(|volumes| volumes.as_mapping_mut())
+    else {
+        return;
+    };
+
+    for volume_name in volume_names {
+        top_level_volumes.remove(serde_yaml::Value::String(volume_name.clone()));
+    }
+}
+
+fn remove_omitted_volumes(
+    yaml: &mut serde_yaml::Value,
+    coastfile: Option<&coast_core::coastfile::Coastfile>,
+) -> bool {
+    let Some(coastfile) = coastfile else {
+        return false;
+    };
+    if coastfile.omit.volumes.is_empty() {
+        return false;
+    }
+    let Some(top_level_volumes) = yaml
+        .get_mut("volumes")
+        .and_then(|volumes| volumes.as_mapping_mut())
+    else {
+        return false;
+    };
+
+    let mut removed_any = false;
+    for volume_name in &coastfile.omit.volumes {
+        if top_level_volumes
+            .remove(serde_yaml::Value::String(volume_name.clone()))
+            .is_some()
+        {
+            tracing::info!(volume = %volume_name, "removed omitted volume from inner compose");
+            removed_any = true;
+        }
+    }
+    removed_any
+}
+
+fn apply_image_overrides(
+    yaml: &mut serde_yaml::Value,
+    per_instance_image_tags: &[(String, String)],
+) -> bool {
+    let mut changed = false;
+    for (service_name, tag) in per_instance_image_tags {
+        if let Some(service_definition) = yaml
+            .get_mut("services")
+            .and_then(|services| services.get_mut(service_name.as_str()))
+            .and_then(|service| service.as_mapping_mut())
+        {
+            service_definition.insert(
+                serde_yaml::Value::String("image".into()),
+                serde_yaml::Value::String(tag.clone()),
+            );
+            service_definition.remove(serde_yaml::Value::String("build".into()));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn apply_coast_managed_volume_overrides(
+    yaml: &mut serde_yaml::Value,
+    coastfile: Option<&coast_core::coastfile::Coastfile>,
+    config: &ComposeRewriteConfig<'_>,
+) -> bool {
+    if !config.has_volume_mounts {
+        return false;
+    }
+    let Some(coastfile) = coastfile else {
+        return false;
+    };
+
+    let top_level_volumes = yaml
+        .as_mapping_mut()
+        .expect("compose root should be a mapping")
+        .entry(serde_yaml::Value::String("volumes".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let Some(volume_map) = top_level_volumes.as_mapping_mut() else {
+        return false;
+    };
+
+    for volume in &coastfile.volumes {
+        volume_map.insert(
+            serde_yaml::Value::String(volume.name.clone()),
+            coast_managed_volume_definition(&volume.name),
+        );
+    }
+    true
+}
+
+fn coast_managed_volume_definition(volume_name: &str) -> serde_yaml::Value {
+    let container_mount = format!("/coast-volumes/{volume_name}");
+    let mut options = serde_yaml::Mapping::new();
+    options.insert(
+        serde_yaml::Value::String("driver".into()),
+        serde_yaml::Value::String("local".into()),
+    );
+    let mut driver_options = serde_yaml::Mapping::new();
+    driver_options.insert(
+        serde_yaml::Value::String("type".into()),
+        serde_yaml::Value::String("none".into()),
+    );
+    driver_options.insert(
+        serde_yaml::Value::String("device".into()),
+        serde_yaml::Value::String(container_mount),
+    );
+    driver_options.insert(
+        serde_yaml::Value::String("o".into()),
+        serde_yaml::Value::String("bind".into()),
+    );
+    options.insert(
+        serde_yaml::Value::String("driver_opts".into()),
+        serde_yaml::Value::Mapping(driver_options),
+    );
+    serde_yaml::Value::Mapping(options)
+}
+
+fn add_service_hosts_and_secret_mounts(
+    yaml: &mut serde_yaml::Value,
+    config: &ComposeRewriteConfig<'_>,
+) -> bool {
+    let Some(services) = yaml
+        .get_mut("services")
+        .and_then(|services| services.as_mapping_mut())
+    else {
+        return false;
+    };
+
+    let service_names: Vec<String> = services
+        .keys()
+        .filter_map(|key| key.as_str().map(String::from))
+        .collect();
+    let mut changed = false;
+
+    for service_name in &service_names {
+        if let Some(service_definition) = services
+            .get_mut(serde_yaml::Value::String(service_name.clone()))
+            .and_then(|service| service.as_mapping_mut())
+        {
+            changed |= ensure_extra_hosts(service_definition, config);
+            changed |= ensure_secret_mounts(service_definition, config.secret_container_paths);
+        }
+    }
+
+    changed
+}
+
+fn ensure_extra_hosts(
+    service_definition: &mut YamlMapping,
+    config: &ComposeRewriteConfig<'_>,
+) -> bool {
+    let hosts_key = serde_yaml::Value::String("extra_hosts".into());
+    let hosts_seq = service_definition
+        .entry(hosts_key)
+        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
+    let Some(sequence) = hosts_seq.as_sequence_mut() else {
+        return false;
+    };
+
+    let existing_hosts: std::collections::HashSet<String> = sequence
+        .iter()
+        .filter_map(|value| value.as_str().map(String::from))
+        .collect();
+    let mut changed = false;
+
+    changed |= push_host_if_missing(
+        sequence,
+        &existing_hosts,
+        "host.docker.internal:host-gateway".to_string(),
+    );
+    for (shared_service_name, host_target) in config.shared_service_hosts {
+        changed |= push_host_if_missing(
+            sequence,
+            &existing_hosts,
+            format!("{shared_service_name}:{host_target}"),
+        );
+    }
+
+    changed
+}
+
+fn push_host_if_missing(
+    sequence: &mut Vec<serde_yaml::Value>,
+    existing_hosts: &std::collections::HashSet<String>,
+    entry: String,
+) -> bool {
+    if existing_hosts.contains(&entry) {
+        return false;
+    }
+    sequence.push(serde_yaml::Value::String(entry));
+    true
+}
+
+fn ensure_secret_mounts(
+    service_definition: &mut YamlMapping,
+    secret_container_paths: &[String],
+) -> bool {
+    if secret_container_paths.is_empty() {
+        return false;
+    }
+
+    let volumes_key = serde_yaml::Value::String("volumes".into());
+    let volumes_seq = service_definition
+        .entry(volumes_key)
+        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
+    let Some(sequence) = volumes_seq.as_sequence_mut() else {
+        return false;
+    };
+
+    for container_path in secret_container_paths {
+        let mount = format!("{container_path}:{container_path}:ro");
+        sequence.push(serde_yaml::Value::String(mount));
+    }
+    true
+}
+
+fn apply_hot_service_rslave_overrides(
+    yaml: &mut serde_yaml::Value,
+    config: &ComposeRewriteConfig<'_>,
+) -> bool {
+    if !config.default_hot && config.hot_services.is_empty() {
+        return false;
+    }
+
+    let Some(services) = yaml
+        .get_mut("services")
+        .and_then(|services| services.as_mapping_mut())
+    else {
+        return false;
+    };
+
+    let service_names: Vec<String> = services
+        .keys()
+        .filter_map(|key| key.as_str().map(String::from))
+        .collect();
+    let mut changed = false;
+
+    for service_name in &service_names {
+        if !is_hot_service(service_name, config) {
+            continue;
+        }
+        if let Some(service_definition) = services
+            .get_mut(serde_yaml::Value::String(service_name.clone()))
+            .and_then(|service| service.as_mapping_mut())
+        {
+            changed |= apply_rslave_to_service_volumes(service_definition);
+        }
+    }
+
+    changed
+}
+
+fn is_hot_service(service_name: &str, config: &ComposeRewriteConfig<'_>) -> bool {
+    config.default_hot
+        || config
+            .hot_services
+            .iter()
+            .any(|service| service == service_name)
+}
+
+fn apply_rslave_to_service_volumes(service_definition: &mut YamlMapping) -> bool {
+    let volumes_key = serde_yaml::Value::String("volumes".into());
+    let Some(volumes) = service_definition
+        .get_mut(&volumes_key)
+        .and_then(|value| value.as_sequence_mut())
+    else {
+        return false;
+    };
+
+    for volume in volumes.iter_mut() {
+        rewrite_volume_with_rslave(volume);
+    }
+    true
 }
 
 /// Rewrite a single compose volume entry to add `rslave` mount propagation.
@@ -395,14 +562,19 @@ fn output_dir(project: &str, instance_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    fn empty_shared_service_hosts() -> &'static HashMap<String, String> {
+        static EMPTY: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
+        &EMPTY
+    }
 
     fn base_config<'a>() -> ComposeRewriteConfig<'a> {
         ComposeRewriteConfig {
-            shared_service_names: &[],
+            shared_service_hosts: empty_shared_service_hosts(),
             coastfile_path: Path::new("/nonexistent-coastfile"),
             per_instance_image_tags: &[],
             has_volume_mounts: false,
-            bridge_gateway_ip: None,
             secret_container_paths: &[],
             project: "test-proj",
             instance_name: "test-inst",
@@ -443,9 +615,9 @@ services:
 volumes:
   pgdata:
 "#;
-        let shared = vec!["postgres".to_string()];
+        let shared = HashMap::from([("postgres".to_string(), "172.17.255.254".to_string())]);
         let config = ComposeRewriteConfig {
-            shared_service_names: &shared,
+            shared_service_hosts: &shared,
             ..base_config()
         };
         let result = rewrite_compose_yaml(compose, &config).unwrap();
@@ -479,9 +651,9 @@ services:
   postgres:
     image: postgres:16
 "#;
-        let shared = vec!["postgres".to_string()];
+        let shared = HashMap::from([("postgres".to_string(), "172.17.255.254".to_string())]);
         let config = ComposeRewriteConfig {
-            shared_service_names: &shared,
+            shared_service_hosts: &shared,
             ..base_config()
         };
         let result = rewrite_compose_yaml(compose, &config).unwrap();
@@ -513,9 +685,9 @@ services:
   postgres:
     image: postgres:16
 "#;
-        let shared = vec!["postgres".to_string()];
+        let shared = HashMap::from([("postgres".to_string(), "172.17.255.254".to_string())]);
         let config = ComposeRewriteConfig {
-            shared_service_names: &shared,
+            shared_service_hosts: &shared,
             ..base_config()
         };
         let result = rewrite_compose_yaml(compose, &config).unwrap();
@@ -542,9 +714,9 @@ services:
   postgres:
     image: postgres:16
 "#;
-        let shared = vec!["postgres".to_string()];
+        let shared = HashMap::from([("postgres".to_string(), "172.17.255.254".to_string())]);
         let config = ComposeRewriteConfig {
-            shared_service_names: &shared,
+            shared_service_hosts: &shared,
             ..base_config()
         };
         let result = rewrite_compose_yaml(compose, &config).unwrap();
@@ -636,16 +808,15 @@ services:
     }
 
     #[test]
-    fn test_shared_service_hostname_uses_bridge_gateway_ip() {
+    fn test_shared_service_hostname_uses_configured_alias_ip() {
         let compose = r#"
 services:
   web:
     image: nginx
 "#;
-        let shared = vec!["postgres".to_string()];
+        let shared = HashMap::from([("postgres".to_string(), "172.17.255.254".to_string())]);
         let config = ComposeRewriteConfig {
-            shared_service_names: &shared,
-            bridge_gateway_ip: Some("172.17.0.1"),
+            shared_service_hosts: &shared,
             ..base_config()
         };
         let result = rewrite_compose_yaml(compose, &config).unwrap();
@@ -658,7 +829,7 @@ services:
             .and_then(|h| h.as_sequence())
             .unwrap();
         let host_strs: Vec<&str> = hosts.iter().filter_map(|v| v.as_str()).collect();
-        assert!(host_strs.contains(&"postgres:172.17.0.1"));
+        assert!(host_strs.contains(&"postgres:172.17.255.254"));
     }
 
     // --- rewrite_compose_yaml: secret volume mounts ---
@@ -727,10 +898,10 @@ services:
 volumes:
   pgdata:
 "#;
-        let shared = vec!["postgres".to_string()];
+        let shared = HashMap::from([("postgres".to_string(), "172.17.255.254".to_string())]);
         let tags = vec![("web".to_string(), "my-web:coast-xyz".to_string())];
         let config = ComposeRewriteConfig {
-            shared_service_names: &shared,
+            shared_service_hosts: &shared,
             per_instance_image_tags: &tags,
             ..base_config()
         };

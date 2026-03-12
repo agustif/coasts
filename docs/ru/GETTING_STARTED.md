@@ -1,6 +1,9 @@
 # Начало работы с Coasts
 
-Если вы ещё этого не сделали, сначала выполните установку и проверьте требования ниже. Затем это руководство проведёт вас через использование Coast в проекте.
+```youtube
+Je921fgJ4RY
+Part of the [Coasts Video Course](learn-coasts-videos/README.md).
+```
 
 ## Установка
 
@@ -54,26 +57,13 @@ Coastfile — это лёгкий TOML-файл, который *обычно* �
 
 Самый быстрый способ создать Coastfile для вашего проекта — поручить это вашему агенту для кодинга.
 
-CLI Coasts поставляется со встроенным промптом, который обучает любого AI-агента полной схеме Coastfile и CLI. Посмотреть его можно здесь: [installation_prompt.txt](installation_prompt.txt)
+CLI Coasts поставляется со встроенным промптом, который обучает любого AI-агента полной схеме Coastfile и CLI. Скопируйте его в чат вашего агента — он проанализирует ваш проект и сгенерирует Coastfile.
 
-Передайте его напрямую вашему агенту или скопируйте [installation prompt](installation_prompt.txt) и вставьте в чат вашего агента:
-
-```bash-emphasis
-# Claude Code
-claude -p "$(coast installation-prompt)"
-
-# Codex
-codex "$(coast installation-prompt)"
-
-# Cursor (from terminal)
-cursor --chat "$(coast installation-prompt)"
-
-# Other agents (manual)
-coast installation-prompt
-# copy the output into your agent's system prompt
+```prompt-copy
+installation_prompt.txt
 ```
 
-Промпт охватывает TOML-формат Coastfile, стратегии томов, внедрение секретов и все релевантные CLI-команды. Ваш агент проанализирует проект и сгенерирует Coastfile.
+Вы также можете получить тот же вывод из CLI, запустив `coast installation-prompt`.
 
 ## Ваш первый Coast
 

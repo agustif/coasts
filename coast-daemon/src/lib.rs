@@ -57,6 +57,7 @@ struct Cli {
 
 /// Main entry point for the coast daemon. Call this from your binary's main().
 pub fn run() {
+    ensure_host_tool_paths();
     let cli = Cli::parse();
 
     if cli.foreground {
@@ -66,6 +67,64 @@ pub fn run() {
         // Daemonize: fork, setsid, then run
         daemonize(cli);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_host_tool_paths() {
+    let current_path = std::env::var_os("PATH");
+    let existing_entries: Vec<std::path::PathBuf> = current_path
+        .as_ref()
+        .map(|path| std::env::split_paths(path).collect())
+        .unwrap_or_default();
+
+    let updated_entries = extend_path_entries(
+        existing_entries.clone(),
+        macos_host_tool_candidates()
+            .iter()
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_dir()),
+    );
+
+    if updated_entries == existing_entries {
+        return;
+    }
+
+    match std::env::join_paths(&updated_entries) {
+        Ok(path) => {
+            unsafe {
+                std::env::set_var("PATH", &path);
+            }
+            tracing::debug!(path = %path.to_string_lossy(), "updated PATH with macOS host tool directories");
+        }
+        Err(error) => {
+            warn!(error = %error, "failed to join augmented PATH entries");
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_host_tool_paths() {}
+
+#[cfg(any(target_os = "macos", test))]
+fn extend_path_entries<I>(
+    mut existing_entries: Vec<std::path::PathBuf>,
+    candidates: I,
+) -> Vec<std::path::PathBuf>
+where
+    I: IntoIterator<Item = std::path::PathBuf>,
+{
+    for candidate in candidates {
+        if !existing_entries.iter().any(|entry| entry == &candidate) {
+            existing_entries.push(candidate);
+        }
+    }
+
+    existing_entries
+}
+
+#[cfg(target_os = "macos")]
+fn macos_host_tool_candidates() -> &'static [&'static str] {
+    &["/opt/homebrew/bin", "/usr/local/bin"]
 }
 
 /// Daemonize the process using fork + setsid.
@@ -757,6 +816,30 @@ mod tests {
         assert!(cli.socket.is_none());
     }
 
+    #[test]
+    fn test_extend_path_entries_appends_only_missing_candidates() {
+        let existing = vec![
+            std::path::PathBuf::from("/usr/bin"),
+            std::path::PathBuf::from("/bin"),
+        ];
+        let updated = extend_path_entries(
+            existing,
+            [
+                std::path::PathBuf::from("/opt/homebrew/bin"),
+                std::path::PathBuf::from("/usr/bin"),
+            ],
+        );
+
+        assert_eq!(
+            updated,
+            vec![
+                std::path::PathBuf::from("/usr/bin"),
+                std::path::PathBuf::from("/bin"),
+                std::path::PathBuf::from("/opt/homebrew/bin"),
+            ]
+        );
+    }
+
     fn make_test_instance(
         name: &str,
         project: &str,
@@ -938,5 +1021,42 @@ mod tests {
                 let _ = port_manager::kill_socat(pid as u32);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_restore_ignores_stopped_instance_with_stale_checkout_pid() {
+        let db = state::StateDb::open_in_memory().unwrap();
+        let state = Arc::new(server::AppState::new_for_testing(db));
+
+        let inst = make_test_instance(
+            "stopped-co",
+            "proj-c",
+            coast_core::types::InstanceStatus::Stopped,
+        );
+        {
+            let db = state.db.lock().await;
+            db.insert_instance(&inst).unwrap();
+            db.insert_port_allocation(
+                "proj-c",
+                "stopped-co",
+                &coast_core::types::PortMapping {
+                    logical_name: "web".to_string(),
+                    canonical_port: 3000,
+                    dynamic_port: 50000,
+                    is_primary: false,
+                },
+            )
+            .unwrap();
+            db.update_socat_pid("proj-c", "stopped-co", "web", Some(4_194_304))
+                .unwrap();
+        }
+
+        restore_running_state(&state).await;
+
+        let db = state.db.lock().await;
+        let updated = db.get_instance("proj-c", "stopped-co").unwrap().unwrap();
+        assert_eq!(updated.status, coast_core::types::InstanceStatus::Stopped);
+        let allocs = db.get_port_allocations("proj-c", "stopped-co").unwrap();
+        assert_eq!(allocs[0].socat_pid, Some(4_194_304));
     }
 }

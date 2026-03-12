@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::types::{InstanceStatus, PortMapping, RuntimeType};
+use crate::types::{InstanceStatus, PortMapping, RuntimeType, SharedServicePort};
 
 use super::*;
 
@@ -93,6 +93,7 @@ fn test_assign_request_roundtrip() {
         worktree: "feature/oauth".to_string(),
         commit_sha: Some("deadbeef".to_string()),
         explain: false,
+        force_sync: false,
     }));
 }
 
@@ -104,6 +105,7 @@ fn test_assign_request_without_commit_sha_roundtrip() {
         worktree: "feature/oauth".to_string(),
         commit_sha: None,
         explain: false,
+        force_sync: false,
     }));
 }
 
@@ -804,7 +806,7 @@ fn test_builds_inspect_response_roundtrip() {
             shared_services: vec![SharedServiceBuildInfo {
                 name: "postgres".to_string(),
                 image: "postgres:15".to_string(),
-                ports: vec![5432],
+                ports: vec![SharedServicePort::same(5432)],
                 auto_create_db: false,
             }],
             volumes: vec![VolumeBuildInfo {
@@ -1023,6 +1025,7 @@ fn test_docker_info_response_serialization() {
         os: "Docker Desktop".to_string(),
         server_version: "28.3.3".to_string(),
         can_adjust: true,
+        provider: "docker-desktop".to_string(),
     };
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["mem_total_bytes"], 8_589_934_592u64);
@@ -1064,6 +1067,64 @@ fn test_set_analytics_response_enabled_roundtrip() {
 fn test_set_analytics_response_disabled_roundtrip() {
     roundtrip_response(Response::SetAnalytics(SetAnalyticsResponse {
         enabled: false,
+    }));
+}
+
+#[test]
+fn test_update_safety_request_roundtrip() {
+    roundtrip_request(Request::IsSafeToUpdate(UpdateSafetyRequest::default()));
+}
+
+#[test]
+fn test_prepare_for_update_request_roundtrip() {
+    roundtrip_request(Request::PrepareForUpdate(PrepareForUpdateRequest {
+        timeout_ms: Some(45_000),
+        close_sessions: true,
+        stop_running_instances: false,
+        stop_shared_services: false,
+    }));
+}
+
+#[test]
+fn test_update_safety_response_roundtrip() {
+    roundtrip_response(Response::UpdateSafety(UpdateSafetyResponse {
+        safe: false,
+        quiescing: true,
+        blockers: vec![UpdateSafetyIssue {
+            kind: UpdateSafetyIssueKind::ActiveOperation,
+            project: Some("my-app".to_string()),
+            instance: Some("dev-1".to_string()),
+            operation: Some("assign".to_string()),
+            summary: "Assign is still in progress".to_string(),
+            suggested_action: Some("Wait for the operation to finish.".to_string()),
+        }],
+        warnings: vec![UpdateSafetyIssue {
+            kind: UpdateSafetyIssueKind::InteractiveSession,
+            project: Some("my-app".to_string()),
+            instance: Some("dev-1".to_string()),
+            operation: None,
+            summary: "An exec session will be disconnected during update.".to_string(),
+            suggested_action: None,
+        }],
+    }));
+}
+
+#[test]
+fn test_prepare_for_update_response_roundtrip() {
+    roundtrip_response(Response::PrepareForUpdate(PrepareForUpdateResponse {
+        ready: true,
+        quiescing: true,
+        timed_out: false,
+        actions: vec![
+            "Blocked new mutating requests.".to_string(),
+            "Closed 2 interactive session(s).".to_string(),
+        ],
+        report: UpdateSafetyResponse {
+            safe: true,
+            quiescing: true,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+        },
     }));
 }
 
@@ -1322,6 +1383,19 @@ fn test_assign_request_explain_roundtrip() {
         worktree: "feature/test".to_string(),
         commit_sha: None,
         explain: true,
+        force_sync: false,
+    }));
+}
+
+#[test]
+fn test_assign_request_force_sync_roundtrip() {
+    roundtrip_request(Request::Assign(AssignRequest {
+        name: "dev-1".to_string(),
+        project: "my-app".to_string(),
+        worktree: "feature/test".to_string(),
+        commit_sha: None,
+        explain: false,
+        force_sync: true,
     }));
 }
 
