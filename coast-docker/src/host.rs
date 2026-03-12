@@ -30,6 +30,21 @@ pub struct DockerEndpoint {
     pub context: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct HostDockerProbe {
+    pub endpoint: Option<DockerEndpoint>,
+    pub docker: Result<Docker>,
+}
+
+pub fn docker_endpoint_source_label(source: &DockerEndpointSource) -> &'static str {
+    match source {
+        DockerEndpointSource::EnvHost => "env_host",
+        DockerEndpointSource::EnvContext => "env_context",
+        DockerEndpointSource::ConfigContext => "config_context",
+        DockerEndpointSource::DefaultLocal => "default_local",
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DockerCliConfig {
     #[serde(rename = "currentContext")]
@@ -51,25 +66,37 @@ struct ContextEndpoint {
 }
 
 pub fn connect_to_host_docker() -> Result<Docker> {
-    connect_to_host_docker_with(
+    probe_host_docker().docker
+}
+
+pub fn probe_host_docker() -> HostDockerProbe {
+    probe_host_docker_with(
         env::var_os("DOCKER_CONFIG").map(PathBuf::from),
         env::var("DOCKER_HOST").ok(),
         env::var("DOCKER_CONTEXT").ok(),
     )
 }
 
-fn connect_to_host_docker_with(
+fn probe_host_docker_with(
     docker_config_dir: Option<PathBuf>,
     env_host: Option<String>,
     env_context: Option<String>,
-) -> Result<Docker> {
-    let endpoint = resolve_docker_endpoint(
+) -> HostDockerProbe {
+    let endpoint = match resolve_docker_endpoint(
         docker_config_dir.as_deref(),
         env_host.as_deref(),
         env_context.as_deref(),
-    )?;
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            return HostDockerProbe {
+                endpoint: None,
+                docker: Err(error),
+            };
+        }
+    };
 
-    match endpoint.source {
+    let docker = match endpoint.source {
         DockerEndpointSource::EnvHost => Docker::connect_with_defaults().map_err(|e| {
             CoastError::docker(format!(
                 "Failed to connect to Docker using DOCKER_HOST='{}'. Error: {e}",
@@ -77,6 +104,11 @@ fn connect_to_host_docker_with(
             ))
         }),
         _ => connect_to_endpoint(&endpoint),
+    };
+
+    HostDockerProbe {
+        endpoint: Some(endpoint),
+        docker,
     }
 }
 
@@ -393,5 +425,23 @@ mod tests {
             resolve_docker_endpoint(Some(temp.path()), None, Some("missing")).unwrap_err();
 
         assert!(error.to_string().contains("Docker context 'missing'"));
+    }
+
+    #[test]
+    fn probe_captures_endpoint_on_connection_failure() {
+        let temp = TempDir::new().unwrap();
+        write_json(
+            &temp.path().join("contexts/meta/hash/meta.json"),
+            r#"{"Name":"orbstack","Endpoints":{"docker":{"Host":"unix:///tmp/does-not-exist.sock"}}}"#,
+        );
+
+        let probe = probe_host_docker_with(
+            Some(temp.path().to_path_buf()),
+            None,
+            Some("orbstack".to_string()),
+        );
+
+        assert!(probe.endpoint.is_some());
+        assert!(probe.docker.is_err());
     }
 }
